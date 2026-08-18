@@ -63,6 +63,7 @@ def _write_ssh_config(alias, key_path):
         "    User git",
         "    IdentityFile {}".format(key_path),
         "    IdentitiesOnly yes",
+        "    StrictHostKeyChecking accept-new",
         end,
         "",
     ])
