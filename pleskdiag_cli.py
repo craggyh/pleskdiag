@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Portable launcher for the Webcore PleskDiag collector.
-
-The collector intentionally remains a single proven script. This launcher applies
-site configuration at runtime, provides `doctor`, and layers in the low-overhead
-MariaDB sampler only when the underlying collector does not already include it.
-"""
+"""Portable launcher for the Webcore PleskDiag collector."""
 from __future__ import print_function
 
 import importlib.util
@@ -115,6 +110,13 @@ def _has_arg(name):
 def main():
     config = pleskdiag_config.load_config()
     argv = sys.argv[1:]
+
+    if argv and argv[0] == "publish-setup":
+        if os.geteuid() != 0:
+            raise SystemExit("pleskdiag must be run as root.")
+        from pleskdiag_publish_setup import main as publish_setup
+        return publish_setup(argv[1:])
+
     if "doctor" in argv:
         command = "doctor"
     elif "publish" in argv:
@@ -138,8 +140,8 @@ def main():
         )
 
     if command == "publish":
-        if not _value(config, "publish", "enabled", True, "bool"):
-            raise SystemExit("Publish is disabled in PleskDiag configuration.")
+        if not _value(config, "publish", "enabled", False, "bool"):
+            raise SystemExit("Publish is not configured. Run: pleskdiag publish-setup --github-repo owner/repo")
         if not _has_arg("--repo"):
             sys.argv.extend(["--repo", _value(config, "publish", "repo_dir", "/opt/webcore-diagnostics")])
         if not _has_arg("--archive"):
