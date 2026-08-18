@@ -14,10 +14,11 @@ except ImportError:
     from urllib2 import urlopen
 
 
-def _run(command, timeout=5):
+def _run(command, timeout=5, cwd=None):
     try:
         proc = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              universal_newlines=True, timeout=timeout, check=False)
+                              universal_newlines=True, timeout=timeout, check=False,
+                              cwd=str(cwd) if cwd else None)
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
     except (OSError, subprocess.SubprocessError) as exc:
         return 127, "", str(exc)
@@ -34,6 +35,13 @@ def _check_status_url(url):
         return False, str(exc)
     good = ("Server Version" in body or "Srv" in body) and ("Request" in body or "Scoreboard" in body)
     return good, "reachable" if good else "reachable, but response does not look like mod_status"
+
+
+def _publish_enabled(config):
+    try:
+        return config.getboolean("publish", "enabled")
+    except Exception:
+        return False
 
 
 def doctor(config, vhost_system_dir, apache_status_url, repo_dir, archive_dir):
@@ -91,9 +99,25 @@ def doctor(config, vhost_system_dir, apache_status_url, repo_dir, archive_dir):
         detail = "running" if f2b_ok else "installed, daemon not responding"
     results.append(_result("Fail2ban", f2b_ok, detail))
 
+    publish_enabled = _publish_enabled(config)
     repo = Path(repo_dir)
-    git_ok = repo.is_dir() and (repo / ".git").exists()
-    results.append(_result("Publish repository", git_ok, "{} ({})".format(repo, "git checkout" if git_ok else "not configured")))
+    if not publish_enabled:
+        results.append(_result("Publishing", True, "disabled (run pleskdiag publish-setup to enable)"))
+    else:
+        git_ok = repo.is_dir() and (repo / ".git").exists()
+        results.append(_result("Publish repository", git_ok,
+                               "{} ({})".format(repo, "git checkout" if git_ok else "not configured")))
+        if git_ok:
+            rc, out, err = _run(["git", "ls-remote", "origin", "HEAD"], timeout=15, cwd=repo)
+            read_ok = rc == 0
+            results.append(_result("Publish read access", read_ok,
+                                   "origin reachable" if read_ok else (err or out or "failed")))
+
+            rc, out, err = _run(["git", "push", "--dry-run", "origin",
+                                 "HEAD:refs/heads/pleskdiag-write-test"], timeout=20, cwd=repo)
+            write_ok = rc == 0
+            results.append(_result("Publish write access", write_ok,
+                                   "dry-run push succeeded" if write_ok else (err or out or "failed")))
 
     archive = Path(archive_dir)
     archive_ok = archive.is_dir() and os.access(str(archive), os.W_OK)
