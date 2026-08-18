@@ -1,0 +1,639 @@
+#!/usr/bin/env python3
+"""Webcore Plesk Diagnostics - incident-oriented Plesk server analyser."""
+import argparse
+import html
+import json
+import os
+import platform
+import re
+import socket
+import subprocess
+import sys
+import time
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+try:
+    from urllib.request import urlopen
+except ImportError:
+    from urllib2 import urlopen
+
+APP_NAME = "Webcore Plesk Diagnostics"
+BASE_DIR = Path(__file__).resolve().parent
+VERSION_FILE = BASE_DIR / "VERSION"
+LOG_RE = re.compile(r'^(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) ([^ ]+)(?: [^"]+)?" (\d{3}) (\S+) "([^"]*)" "([^"]*)"')
+SUSPICIOUS = [
+    ("wp-login", re.compile(r"/wp-login\.php", re.I)),
+    ("xmlrpc", re.compile(r"/xmlrpc\.php", re.I)),
+    ("config/exploit probe", re.compile(r"/(?:\.env|\.git(?:/|$)|wp-config|phpinfo\.php)|(?:wp_filemanager|vendor/phpunit|eval-stdin\.php|shell\.php)", re.I)),
+]
+STATIC_RE = re.compile(r"\.(?:css|js|mjs|map|jpg|jpeg|png|gif|webp|avif|svg|ico|woff2?|ttf|eot|mp4|webm|mp3|wav|pdf|zip|gz|xml|txt)(?:\?|$)", re.I)
+DYNAMIC_RE = re.compile(r"(?:\.php(?:\?|$)|/wp-json(?:/|\?|$)|/wp-cron(?:\.php)?(?:\?|$)|/xmlrpc\.php(?:\?|$)|/wp-admin/admin-ajax\.php(?:\?|$))", re.I)
+KNOWN_WP_PHP = set([
+    "index.php", "wp-login.php", "wp-cron.php", "xmlrpc.php", "wp-comments-post.php",
+    "wp-activate.php", "wp-blog-header.php", "wp-links-opml.php", "wp-load.php",
+    "wp-mail.php", "wp-signup.php", "wp-trackback.php", "admin-ajax.php",
+    "admin-post.php", "async-upload.php", "load-scripts.php", "load-styles.php",
+])
+SUSPICIOUS_PHP_NAME_RE = re.compile(r"^(?:ok|bb|mini|fff|get|output|users|ms-files|ws\d+|wp\d+)\.php$", re.I)
+SAMPLE_SECONDS = 10
+SAMPLE_INTERVAL = 2
+APACHE_STATUS_URL = "http://127.0.0.1:7080/pleskdiag-server-status"
+
+
+def version():
+    try:
+        with VERSION_FILE.open("r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return "unknown"
+
+
+def run(command):
+    try:
+        return subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              universal_newlines=True, timeout=10, check=False).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise SystemExit("pleskdiag must be run as root.")
+
+
+def memory_info():
+    values = {}
+    try:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                key, value = line.split(":", 1)
+                values[key] = int(value.strip().split()[0]) * 1024
+    except (OSError, ValueError):
+        return {}
+    total = values.get("MemTotal", 0)
+    available = values.get("MemAvailable", 0)
+    return {"used_percent": round((total - available) / total * 100, 1) if total else None}
+
+
+def choose_log(logdir, candidates):
+    for name in candidates:
+        path = logdir / name
+        try:
+            if path.exists() and path.stat().st_size:
+                return str(path)
+        except OSError:
+            pass
+    return None
+
+
+def domains():
+    root = Path("/var/www/vhosts/system")
+    out = []
+    if not root.is_dir():
+        return out
+    for entry in sorted(root.iterdir(), key=lambda item: item.name):
+        if not entry.is_dir():
+            continue
+        logdir = entry / "logs"
+        out.append({"domain": entry.name,
+                    "http_log": choose_log(logdir, ["proxy_access_log", "access_log"]),
+                    "https_log": choose_log(logdir, ["proxy_access_ssl_log", "access_ssl_log"])})
+    return out
+
+
+def logtime(value):
+    try:
+        return datetime.strptime(value[:-6], "%d/%b/%Y:%H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+
+
+def reverse_lines(path, block_size=65536):
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        remainder = b""
+        while position > 0:
+            size = min(block_size, position)
+            position -= size
+            handle.seek(position)
+            chunk = handle.read(size) + remainder
+            lines = chunk.split(b"\n")
+            remainder = lines[0]
+            for raw in reversed(lines[1:]):
+                if raw:
+                    yield raw.decode("utf-8", "replace")
+        if remainder:
+            yield remainder.decode("utf-8", "replace")
+
+
+def is_static(url):
+    return bool(STATIC_RE.search(url))
+
+
+def is_redirect_only(status):
+    return status in ("301", "302", "307", "308")
+
+
+def is_application_request(method, url, status):
+    if is_redirect_only(status) or is_static(url):
+        return False
+    method = method.upper()
+    if method in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+        return True
+    return bool(DYNAMIC_RE.search(url))
+
+
+def suspicious_php_path(url):
+    path = url.split("?", 1)[0]
+    low = path.lower()
+    base = low.rsplit("/", 1)[-1]
+    if not base.endswith(".php"):
+        return False
+    if "/wp-content/uploads/" in low:
+        return True
+    if SUSPICIOUS_PHP_NAME_RE.match(base):
+        return True
+    if base not in KNOWN_WP_PHP and (low.count("/") <= 2 or "/wp-content/" in low):
+        return True
+    return False
+
+
+def classify_live_request(method, url):
+    low = url.lower()
+    labels = []
+    if "action=as_async_request_queue_runner" in low:
+        labels.append("Action Scheduler async runner")
+    if "/wp-cron.php" in low:
+        labels.append("WP-Cron")
+    if "/wp-login.php" in low or "/wp-admin/" in low:
+        labels.append("WordPress login/admin")
+    if "/xmlrpc.php" in low:
+        labels.append("XML-RPC")
+    if ("/events/" in low or "/calendar/" in low or "eventdate=" in low or
+            "eventdisplay=" in low or "tribe-bar-date=" in low or
+            "?ical=" in low or "&ical=" in low or "outlook-ical=" in low):
+        labels.append("Events Calendar/archive")
+    if "/wp-json/" in low:
+        labels.append("WordPress REST API")
+    if suspicious_php_path(url):
+        labels.append("Suspicious PHP/webshell-style path")
+    if method.upper() == "POST" and not labels:
+        labels.append("POST application request")
+    return labels
+
+
+def analyse_file(path, cutoff):
+    result = {"requests": 0, "ips": Counter(), "urls": Counter(), "methods": Counter(),
+              "statuses": Counter(), "attacks": Counter(), "xmlrpc_ips": Counter(),
+              "xmlrpc_statuses": Counter(), "xmlrpc_agents": Counter(),
+              "dynamic_urls": Counter(), "post_urls": Counter(), "lines_examined": 0,
+              "static_requests": 0, "redirect_requests": 0, "application_requests": 0,
+              "application_urls": Counter(), "application_ips": Counter(),
+              "application_methods": Counter(), "application_statuses": Counter(),
+              "ip_urls": defaultdict(Counter), "ip_methods": defaultdict(Counter),
+              "ip_statuses": defaultdict(Counter), "app_ip_urls": defaultdict(Counter),
+              "app_ip_methods": defaultdict(Counter), "app_ip_statuses": defaultdict(Counter),
+              "app_ip_agents": defaultdict(Counter), "app_ip_referers": defaultdict(Counter)}
+    if not path:
+        return result
+    try:
+        for line in reverse_lines(path):
+            result["lines_examined"] += 1
+            match = LOG_RE.match(line)
+            if not match:
+                continue
+            ip, stamp, method, url, status, size, referer, agent = match.groups()
+            when = logtime(stamp)
+            if not when:
+                continue
+            if when < cutoff:
+                break
+            result["requests"] += 1
+            result["ips"][ip] += 1
+            result["urls"][url] += 1
+            result["methods"][method] += 1
+            result["statuses"][status] += 1
+            result["ip_urls"][ip][url] += 1
+            result["ip_methods"][ip][method] += 1
+            result["ip_statuses"][ip][status] += 1
+            if is_static(url):
+                result["static_requests"] += 1
+            if is_redirect_only(status):
+                result["redirect_requests"] += 1
+            if DYNAMIC_RE.search(url) and not is_static(url) and not is_redirect_only(status):
+                result["dynamic_urls"][(method, url)] += 1
+            if method.upper() == "POST":
+                result["post_urls"][url] += 1
+            if is_application_request(method, url, status):
+                result["application_requests"] += 1
+                result["application_urls"][(method, url)] += 1
+                result["application_ips"][ip] += 1
+                result["application_methods"][method] += 1
+                result["application_statuses"][status] += 1
+                result["app_ip_urls"][ip][(method, url)] += 1
+                result["app_ip_methods"][ip][method] += 1
+                result["app_ip_statuses"][ip][status] += 1
+                if agent and agent != "-":
+                    result["app_ip_agents"][ip][agent] += 1
+                if referer and referer != "-":
+                    result["app_ip_referers"][ip][referer] += 1
+            for label, pattern in SUSPICIOUS:
+                if pattern.search(url):
+                    result["attacks"][label] += 1
+            if suspicious_php_path(url):
+                result["attacks"]["suspicious PHP/webshell-style path"] += 1
+            if re.match(r"^/xmlrpc\.php(?:\?|$)", url, re.I):
+                result["xmlrpc_ips"][ip] += 1
+                result["xmlrpc_statuses"][status] += 1
+                result["xmlrpc_agents"][agent] += 1
+    except OSError:
+        pass
+    return result
+
+
+def merge_nested(a, b):
+    out = defaultdict(Counter)
+    for source in (a, b):
+        for key, counter in source.items():
+            out[key].update(counter)
+    return out
+
+
+def traffic(item, minutes, now):
+    cutoff = now - timedelta(minutes=minutes)
+    http = analyse_file(item["http_log"], cutoff)
+    https = analyse_file(item["https_log"], cutoff)
+    combined = {}
+    for key in ["ips", "urls", "methods", "statuses", "attacks", "xmlrpc_ips", "xmlrpc_statuses",
+                "xmlrpc_agents", "dynamic_urls", "post_urls", "application_urls", "application_ips",
+                "application_methods", "application_statuses"]:
+        combined[key] = http[key] + https[key]
+    nested = {key: merge_nested(http[key], https[key]) for key in
+              ["ip_urls", "ip_methods", "ip_statuses", "app_ip_urls", "app_ip_methods",
+               "app_ip_statuses", "app_ip_agents", "app_ip_referers"]}
+    requests = http["requests"] + https["requests"]
+    app_requests = http["application_requests"] + https["application_requests"]
+    statuses = combined["statuses"]
+    top_ips = combined["ips"].most_common(5)
+    top_ip_details = [{"ip": ip, "requests": count,
+                       "percent": round(count / float(requests) * 100, 1) if requests else 0.0,
+                       "top_urls": nested["ip_urls"][ip].most_common(5),
+                       "methods": dict(nested["ip_methods"][ip]),
+                       "statuses": dict(nested["ip_statuses"][ip])} for ip, count in top_ips]
+    app_top_ips = combined["application_ips"].most_common(5)
+    app_ip_details = [{"ip": ip, "requests": count,
+                       "percent": round(count / float(app_requests) * 100, 1) if app_requests else 0.0,
+                       "top_urls": nested["app_ip_urls"][ip].most_common(5),
+                       "methods": dict(nested["app_ip_methods"][ip]),
+                       "statuses": dict(nested["app_ip_statuses"][ip]),
+                       "agents": nested["app_ip_agents"][ip].most_common(3),
+                       "referers": nested["app_ip_referers"][ip].most_common(3)} for ip, count in app_top_ips]
+    return {"domain": item["domain"], "http_log": item["http_log"], "https_log": item["https_log"],
+            "http_requests": http["requests"], "https_requests": https["requests"],
+            "requests": requests, "rate_per_min": round(requests / float(minutes), 1),
+            "unique_ips": len(combined["ips"]),
+            "static_requests": http["static_requests"] + https["static_requests"],
+            "redirect_requests": http["redirect_requests"] + https["redirect_requests"],
+            "application_requests": app_requests,
+            "application_rate_per_min": round(app_requests / float(minutes), 1),
+            "application_unique_ips": len(combined["application_ips"]),
+            "errors_4xx": sum(v for k, v in statuses.items() if k.startswith("4")),
+            "errors_5xx": sum(v for k, v in statuses.items() if k.startswith("5")),
+            "methods": dict(combined["methods"]), "statuses": dict(statuses),
+            "top_ips": top_ips, "top_ip_details": top_ip_details,
+            "top_ip_percent": top_ip_details[0]["percent"] if top_ip_details else 0.0,
+            "top5_ip_percent": round(sum(c for _, c in top_ips) / float(requests) * 100, 1) if requests else 0.0,
+            "application_top_ips": app_top_ips, "application_ip_details": app_ip_details,
+            "application_top_ip_percent": app_ip_details[0]["percent"] if app_ip_details else 0.0,
+            "application_top5_ip_percent": round(sum(c for _, c in app_top_ips) / float(app_requests) * 100, 1) if app_requests else 0.0,
+            "top_urls": combined["urls"].most_common(8),
+            "application_urls": combined["application_urls"].most_common(8),
+            "application_methods": dict(combined["application_methods"]),
+            "application_statuses": dict(combined["application_statuses"]),
+            "dynamic_urls": combined["dynamic_urls"].most_common(8),
+            "post_urls": combined["post_urls"].most_common(8),
+            "attacks": dict(combined["attacks"]),
+            "xmlrpc_requests": sum(combined["xmlrpc_ips"].values()),
+            "xmlrpc_ips": combined["xmlrpc_ips"].most_common(5),
+            "xmlrpc_statuses": dict(combined["xmlrpc_statuses"]),
+            "xmlrpc_agents": combined["xmlrpc_agents"].most_common(5),
+            "lines_examined": http["lines_examined"] + https["lines_examined"]}
+
+
+def proc_snapshot():
+    rows = []
+    output = run(["ps", "-eo", "pid=,user=,pcpu=,pmem=,etime=,comm=,args=", "--sort=-pcpu"])
+    for line in output.splitlines()[:150]:
+        parts = line.strip().split(None, 6)
+        if len(parts) < 7:
+            continue
+        pid, user, cpu, mem, etime, comm, args = parts
+        try:
+            cpu, mem = float(cpu), float(mem)
+        except ValueError:
+            continue
+        rows.append({"pid": pid, "user": user, "cpu": cpu, "mem": mem, "etime": etime,
+                     "comm": comm, "args": args})
+    return rows
+
+
+def php_correlation(procs, names):
+    by = defaultdict(lambda: {"workers": 0, "cpu": 0.0, "mem": 0.0, "processes": []})
+    php = [p for p in procs if "php" in p["comm"].lower() or "php-fpm" in p["args"].lower()]
+    for proc in php:
+        haystack = (proc["user"] + " " + proc["args"]).lower()
+        for name in names:
+            if name.lower() in haystack:
+                row = by[name]
+                row["workers"] += 1
+                row["cpu"] += proc["cpu"]
+                row["mem"] += proc["mem"]
+                row["processes"].append(proc)
+                break
+    for row in by.values():
+        row["cpu"] = round(row["cpu"], 1)
+        row["mem"] = round(row["mem"], 1)
+        row["processes"] = row["processes"][:5]
+    return {"domains": dict(by), "total_php_processes": len(php)}
+
+
+def fetch_apache_status():
+    try:
+        body = urlopen(APACHE_STATUS_URL, timeout=1.5).read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    rows = []
+    for block in re.findall(r"<tr>(.*?)</tr>", body, re.S | re.I):
+        cols = [html.unescape(re.sub(r"<[^>]+>", "", cell)).strip()
+                for cell in re.findall(r"<td[^>]*>(.*?)</td>", block, re.S | re.I)]
+        if len(cols) < 15 or cols[3].strip() in ("_", "."):
+            continue
+        vhost, request = cols[13].strip(), cols[14].strip()
+        if not vhost or "pleskdiag-server-status" in request:
+            continue
+        parts = request.split()
+        method = parts[0] if parts else ""
+        url = parts[1] if len(parts) > 1 else request
+        try:
+            ss = int(cols[5])
+        except (TypeError, ValueError):
+            ss = 0
+        rows.append({"mode": cols[3].strip(), "pid": cols[1], "ss": ss, "client": cols[11],
+                     "protocol": cols[12], "vhost": vhost, "domain": vhost.split(":", 1)[0].lower(),
+                     "method": method, "url": url, "request": request,
+                     "patterns": classify_live_request(method, url)})
+    return rows
+
+
+def sample_runtime(names, seconds=SAMPLE_SECONDS, interval=SAMPLE_INTERVAL):
+    samples = max(2, int(seconds / float(interval)) + 1)
+    stats = defaultdict(lambda: {"cpu_values": [], "peak_cpu": 0.0, "peak_workers": 0,
+                                "pids": set(), "active_samples": 0})
+    live = defaultdict(lambda: {"samples_with_requests": 0, "peak_concurrent": 0,
+                               "requests": {}, "patterns": Counter(), "clients": Counter()})
+    status_available, last_procs = False, []
+    for index in range(samples):
+        last_procs = proc_snapshot()
+        corr = php_correlation(last_procs, names)["domains"]
+        for name in names:
+            row = corr.get(name, {})
+            cpu = row.get("cpu", 0.0)
+            workers = row.get("workers", 0)
+            stat = stats[name]
+            stat["cpu_values"].append(cpu)
+            stat["peak_cpu"] = max(stat["peak_cpu"], cpu)
+            stat["peak_workers"] = max(stat["peak_workers"], workers)
+            if workers:
+                stat["active_samples"] += 1
+            for proc in row.get("processes", []):
+                stat["pids"].add(proc["pid"])
+        apache_rows = fetch_apache_status()
+        if apache_rows is not None:
+            status_available = True
+            by_domain = defaultdict(list)
+            for req in apache_rows:
+                if req["domain"] in names:
+                    by_domain[req["domain"]].append(req)
+            for name, requests in by_domain.items():
+                live[name]["samples_with_requests"] += 1
+                live[name]["peak_concurrent"] = max(live[name]["peak_concurrent"], len(requests))
+                for req in requests:
+                    key = (req["client"], req["method"], req["url"])
+                    seen = live[name]["requests"].get(key)
+                    if not seen:
+                        seen = {"client": req["client"], "method": req["method"], "url": req["url"],
+                                "samples_seen": 0, "max_ss": 0, "patterns": req["patterns"]}
+                        live[name]["requests"][key] = seen
+                    seen["samples_seen"] += 1
+                    seen["max_ss"] = max(seen["max_ss"], req["ss"])
+                    live[name]["clients"][req["client"]] += 1
+                    for label in req["patterns"]:
+                        live[name]["patterns"][label] += 1
+        if index < samples - 1:
+            time.sleep(interval)
+    sampled = {}
+    for name, stat in stats.items():
+        values = stat["cpu_values"]
+        sampled[name] = {"avg_cpu": round(sum(values) / len(values), 1) if values else 0.0,
+                         "peak_cpu": round(stat["peak_cpu"], 1), "peak_workers": stat["peak_workers"],
+                         "workers_seen": len(stat["pids"]), "active_samples": stat["active_samples"],
+                         "samples": samples}
+    live_result = {}
+    for name in names:
+        row = live.get(name)
+        if not row:
+            continue
+        requests = list(row["requests"].values())
+        requests.sort(key=lambda x: (x["samples_seen"], x["max_ss"]), reverse=True)
+        live_result[name] = {"samples_with_requests": row["samples_with_requests"],
+                             "peak_concurrent": row["peak_concurrent"],
+                             "unique_requests": len(requests), "requests": requests[:12],
+                             "patterns": dict(row["patterns"]),
+                             "top_clients": row["clients"].most_common(5)}
+    return sampled, last_procs, status_available, live_result
+
+
+def snapshot(minutes):
+    ds = domains()
+    now = datetime.now()
+    tr = [traffic(item, minutes, now) for item in ds]
+    tr.sort(key=lambda row: row["requests"], reverse=True)
+    names = [item["domain"] for item in ds]
+    sampled, procs, status_available, live = sample_runtime(names)
+    return {"tool_version": version(), "hostname": socket.getfqdn(),
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "python": platform.python_version(), "cpu_count": os.cpu_count(),
+            "load_average": [round(x, 2) for x in os.getloadavg()], "memory": memory_info(),
+            "window_minutes": minutes, "traffic": tr, "top_processes": procs[:15],
+            "php": php_correlation(procs, names), "php_sampled": sampled,
+            "sample_seconds": SAMPLE_SECONDS, "sample_interval": SAMPLE_INTERVAL,
+            "apache_status_available": status_available, "live_requests": live}
+
+
+def report(data):
+    print("=" * 100)
+    print(" {} v{}\n Server: {}   Window: last {} minutes".format(
+        APP_NAME, data["tool_version"], data["hostname"], data["window_minutes"]))
+    print("=" * 100)
+    print("Load: {}   CPU cores: {}   Memory: {}%".format(
+        " / ".join(map(str, data["load_average"])), data["cpu_count"],
+        data["memory"].get("used_percent", "n/a")))
+    print("\nTOP PROCESSES NOW\n-----------------")
+    print("{:>7} {:<18} {:>6} {:>6} {:<12} {}".format("PID", "USER", "CPU%", "MEM%", "ELAPSED", "COMMAND"))
+    for p in data["top_processes"][:12]:
+        print("{:>7} {:<18} {:>6.1f} {:>6.1f} {:<12} {}".format(
+            p["pid"], p["user"][:18], p["cpu"], p["mem"], p["etime"], p["args"][:72]))
+
+    print("\nPHP-FPM SAMPLED CORRELATION ({}s)\n-------------------------------".format(data["sample_seconds"]))
+    print("{:<34} {:>9} {:>9} {:>9} {:>10}".format("DOMAIN", "AVG CPU", "PEAK CPU", "PEAK WRK", "PIDS SEEN"))
+    for name, row in sorted(data["php_sampled"].items(), key=lambda x: x[1]["avg_cpu"], reverse=True):
+        if row["peak_cpu"] > 0:
+            print("{:<34} {:>8.1f}% {:>8.1f}% {:>9} {:>10}".format(
+                name[:34], row["avg_cpu"], row["peak_cpu"], row["peak_workers"], row["workers_seen"]))
+
+    print("\nDOMAIN TRAFFIC (application requests exclude static assets and redirects)\n------------------------------------------------------------------------")
+    print("{:<32} {:>7} {:>7} {:>8} {:>8} {:>8} {:>7}".format(
+        "DOMAIN", "TOTAL", "APP", "STATIC", "REDIR", "APP/MIN", "APP IPS"))
+    print("-" * 100)
+    for row in data["traffic"]:
+        print("{:<32} {:>7} {:>7} {:>8} {:>8} {:>8.1f} {:>7}".format(
+            row["domain"][:32], row["requests"], row["application_requests"],
+            row["static_requests"], row["redirect_requests"],
+            row["application_rate_per_min"], row["application_unique_ips"]))
+
+    print("\nLIVE APACHE CORRELATION\n-----------------------")
+    if not data.get("apache_status_available"):
+        print("Unavailable: localhost mod_status endpoint not detected.")
+        print("Expected: {}".format(APACHE_STATUS_URL))
+    else:
+        hot_live = []
+        for name, live in data.get("live_requests", {}).items():
+            php = data["php_sampled"].get(name, {})
+            if live.get("unique_requests") and (php.get("peak_cpu", 0) >= 10 or live.get("patterns")):
+                hot_live.append((php.get("avg_cpu", 0), name, live))
+        if not hot_live:
+            print("No relevant active application requests captured during the sample.")
+        for avg_cpu, name, live in sorted(hot_live, reverse=True):
+            php = data["php_sampled"].get(name, {})
+            print("\n{}".format(name))
+            print("  PHP: avg {:.1f}% peak {:.1f}%   live samples {}/{}   peak concurrent {}".format(
+                php.get("avg_cpu", 0.0), php.get("peak_cpu", 0.0), live["samples_with_requests"],
+                php.get("samples", 0), live["peak_concurrent"]))
+            if live["patterns"]:
+                print("  Live patterns: " + ", ".join("{} ({})".format(k, v) for k, v in
+                      sorted(live["patterns"].items(), key=lambda x: x[1], reverse=True)))
+            print("  Active requests observed:")
+            for req in live["requests"][:8]:
+                print("    {:>3}s  {:<15} {:<5} {}  [{}/{} samples]".format(
+                    req["max_ss"], req["client"][:15], req["method"][:5], req["url"][:62],
+                    req["samples_seen"], php.get("samples", 0)))
+            if live["patterns"].get("Suspicious PHP/webshell-style path", 0):
+                print("  SECURITY ALERT [HIGH]: suspicious PHP/webshell-style paths were active during sampling; verify filesystem and response status immediately.")
+            if live["patterns"].get("Action Scheduler async runner", 0) and php.get("avg_cpu", 0) >= 50:
+                print("  HIGH CONFIDENCE: long-lived Action Scheduler work overlaps with heavy PHP CPU.")
+            if live["patterns"].get("Events Calendar/archive", 0) >= 2 and php.get("avg_cpu", 0) >= 20:
+                print("  HIGH CONFIDENCE: Events Calendar/archive crawling overlaps with PHP load.")
+            if live["patterns"].get("WordPress login/admin", 0) >= 3:
+                print("  WARNING: repeated WordPress login/admin activity observed live.")
+
+    print("\nROOT-CAUSE CANDIDATES\n---------------------")
+    candidates = []
+    for row in data["traffic"]:
+        php = data["php_sampled"].get(row["domain"], {})
+        live = data.get("live_requests", {}).get(row["domain"], {})
+        avg_cpu, peak_cpu = php.get("avg_cpu", 0.0), php.get("peak_cpu", 0.0)
+        security_bonus = 75.0 if live.get("patterns", {}).get("Suspicious PHP/webshell-style path", 0) else 0.0
+        score = avg_cpu + security_bonus + min(live.get("unique_requests", 0) * 3.0, 50.0) + \
+                min(sum(live.get("patterns", {}).values()) * 2.0, 50.0) + \
+                min(row["xmlrpc_requests"] * 2.0, 100.0) + min(row["errors_5xx"], 50)
+        if avg_cpu >= 10 or peak_cpu >= 30 or row["xmlrpc_requests"] >= 5 or row["errors_5xx"] >= 5 or security_bonus:
+            candidates.append((score, row, php, live))
+    for score, row, php, live in sorted(candidates, reverse=True, key=lambda x: x[0])[:8]:
+        print("\n{}".format(row["domain"]))
+        print("  OBSERVED: PHP CPU avg {:.1f}% peak {:.1f}%; peak workers {}; PIDs seen {}".format(
+            php.get("avg_cpu", 0.0), php.get("peak_cpu", 0.0), php.get("peak_workers", 0),
+            php.get("workers_seen", 0)))
+        print("  Requests: total {}   application {} ({:.1f}/min)   static {}   redirects {}".format(
+            row["requests"], row["application_requests"], row["application_rate_per_min"],
+            row["static_requests"], row["redirect_requests"]))
+        print("  Errors: 4xx {}   5xx {}   XML-RPC {}".format(
+            row["errors_4xx"], row["errors_5xx"], row["xmlrpc_requests"]))
+        if live:
+            print("  LIVE: {} unique active requests; peak concurrent {}; seen in {}/{} samples".format(
+                live.get("unique_requests", 0), live.get("peak_concurrent", 0),
+                live.get("samples_with_requests", 0), php.get("samples", 0)))
+            if live.get("patterns"):
+                print("  LIVE PATTERNS: " + ", ".join("{}={}".format(k, v) for k, v in
+                      sorted(live["patterns"].items(), key=lambda x: x[1], reverse=True)))
+            for req in live.get("requests", [])[:5]:
+                print("    {:>3}s {:<15} {:<5} {}".format(
+                    req["max_ss"], req["client"][:15], req["method"][:5], req["url"][:68]))
+        print("  Application concentration: top IP {:.1f}%   top 5 IPs {:.1f}%".format(
+            row["application_top_ip_percent"], row["application_top5_ip_percent"]))
+        if row["application_urls"]:
+            print("  Top completed application/page requests:")
+            for (method, url), count in row["application_urls"][:6]:
+                print("    {:>5}  {:<5} {}".format(count, method, url[:75]))
+        if row["xmlrpc_requests"]:
+            print("  XML-RPC top IPs: " + ", ".join("{} ({})".format(ip, count) for ip, count in row["xmlrpc_ips"]))
+        avg = php.get("avg_cpu", 0.0)
+        app = row["application_requests"]
+        patterns = live.get("patterns", {}) if live else {}
+        if patterns.get("Suspicious PHP/webshell-style path", 0):
+            print("  SECURITY ALERT [HIGH]: suspicious PHP/webshell-style requests observed live. This is a compromise/probe signal; filesystem existence and HTTP status must be checked before attributing CPU causation.")
+        if avg >= 50 and patterns.get("Action Scheduler async runner", 0):
+            print("  LIKELY CAUSE [HIGH]: Action Scheduler async processing overlaps with sustained PHP CPU.")
+        elif avg >= 20 and patterns.get("Events Calendar/archive", 0) >= 2:
+            print("  LIKELY CAUSE [HIGH]: live Events Calendar/archive crawling overlaps with PHP workload.")
+        elif avg >= 50 and live.get("unique_requests", 0):
+            print("  CORRELATED [MEDIUM]: active Apache application requests overlap with sustained PHP CPU.")
+        elif avg >= 50 and app:
+            print("  CORRELATED [LOW]: sustained PHP CPU overlaps with completed application requests.")
+            print("  CAUSATION: not proven; live request evidence was insufficient.")
+        elif avg >= 50:
+            print("  UNEXPLAINED: high PHP CPU with no matching completed or live application request captured.")
+            print("  NEXT: investigate background CLI/cron/database work or increase live sampling duration.")
+
+    print("\nSUSPICIOUS REQUESTS\n-------------------")
+    for row in data["traffic"]:
+        if row["attacks"]:
+            print("{}: {}".format(row["domain"], ", ".join(
+                "{} ({})".format(k, v) for k, v in row["attacks"].items())))
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="pleskdiag", description=APP_NAME)
+    parser.add_argument("command", nargs="?", choices=["scan", "export", "publish"], default="scan")
+    parser.add_argument("--minutes", type=int, default=15)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--repo", help="diagnostics git checkout (default: /opt/webcore-diagnostics)")
+    parser.add_argument("--archive", help="local archive root (default: /var/log/pleskdiag)")
+    parser.add_argument("--version", action="version", version="%(prog)s {}".format(version()))
+    args = parser.parse_args()
+    require_root()
+    if args.minutes < 1 or args.minutes > 1440:
+        parser.error("--minutes must be between 1 and 1440")
+
+    data = snapshot(args.minutes)
+    if args.command == "publish":
+        try:
+            from pleskdiag_publish import publish
+            result = publish(data, report, repo_path=args.repo, archive_root=args.archive)
+        except Exception as exc:
+            raise SystemExit("Publish failed: {}".format(exc))
+        print("Published PleskDiag scan")
+        print("  Commit:  {}".format(result["commit"]))
+        print("  Repo:    {}".format(result["repo_path"]))
+        print("  Archive: {}".format(result["archive_path"]))
+    elif args.command == "export" or args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        report(data)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
