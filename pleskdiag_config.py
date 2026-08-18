@@ -20,8 +20,10 @@ DEFAULTS = {
         "status_url": "http://127.0.0.1:7080/pleskdiag-server-status",
     },
     "publish": {
-        "enabled": "true",
+        "enabled": "false",
         "repo_dir": "/opt/webcore-diagnostics",
+        "github_repo": "",
+        "ssh_host": "",
     },
 }
 
